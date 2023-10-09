@@ -3,7 +3,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 # hyperparameters
-batch_size = 64 # how many independent sequences will we process in parallel?
+batch_size = 32 # how many independent sequences will we process in parallel?
 block_size = 256 # what is the maximum context length for predictions?
 max_iters = 5000
 eval_interval = 500
@@ -11,9 +11,10 @@ learning_rate = 3e-4
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 eval_iters = 200
 n_embd = 384
-n_head = 6
+n_head = 6 # each head has 384/6 = 64 as is standard
 n_layer = 6
 dropout = 0.2
+
 # ------------
 
 torch.manual_seed(1337)
@@ -47,9 +48,19 @@ def get_batch(split):
     x, y = x.to(device), y.to(device)
     return x, y
 
+# KK: GOod practice to call no grad because PyTorch will not need to keep track of the computation graph & gradients
+# This will save memory - no backpropagation
 @torch.no_grad()
 def estimate_loss():
+    """
+    ### Keiji comments
+    Average out the loss over a few batches
+    Get it for both splits - train & val
+    """
     out = {}
+    # KK: set model to eval mode
+    # Right now in this bigram model with only an embedding layer, this doesn't matter
+    # But in the GPT model, this will matter because of the dropout layers
     model.eval()
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
@@ -58,8 +69,10 @@ def estimate_loss():
             logits, loss = model(X, Y)
             losses[k] = loss.item()
         out[split] = losses.mean()
+    # KK: set model back to train mode
     model.train()
     return out
+
 
 class Head(nn.Module):
     """ one head of self-attention """
@@ -71,7 +84,6 @@ class Head(nn.Module):
         self.value = nn.Linear(n_embd, head_size, bias=False)
         # In PyTorch naming conventions, this is not a paramter of the model, it's just a buffer
         self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
-
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
@@ -90,6 +102,7 @@ class Head(nn.Module):
         out = wei @ v # (B, T, T) @ (B, T, hs) -> (B, T, hs)
         return out
 
+
 class MultiHeadAttention(nn.Module):
     """ multiple heads of self-attention in parallel """
 
@@ -101,9 +114,12 @@ class MultiHeadAttention(nn.Module):
 
     def forward(self, x):
         out = torch.cat([h(x) for h in self.heads], dim=-1)
+        out = self.proj(out)
         out = self.dropout(self.proj(out))
         return out
+    
 
+# Each token independently needs to "think" on the data collected from qkv independently
 class FeedFoward(nn.Module):
     """ a simple linear layer followed by a non-linearity """
 
@@ -119,6 +135,8 @@ class FeedFoward(nn.Module):
     def forward(self, x):
         return self.net(x)
 
+
+
 class Block(nn.Module):
     """ Transformer block: communication followed by computation """
 
@@ -132,11 +150,18 @@ class Block(nn.Module):
         self.ln2 = nn.LayerNorm(n_embd)
 
     def forward(self, x):
+        #x = self.sa(x)
+        #x = self.ffwd(x)
+        # Apply layer norm BEFORE the self attention
         x = x + self.sa(self.ln1(x))
+        # Apply layer norm BEFORE the feed forward
         x = x + self.ffwd(self.ln2(x))
         return x
+    
 
-class GPTLanguageModel(nn.Module):
+
+# super simple bigram model
+class BigramLanguageModel(nn.Module):
 
     def __init__(self):
         super().__init__()
@@ -147,26 +172,34 @@ class GPTLanguageModel(nn.Module):
         self.ln_f = nn.LayerNorm(n_embd) # final layer norm
         self.lm_head = nn.Linear(n_embd, vocab_size)
 
-        # better init, not covered in the original GPT video, but important, will cover in followup video
-        self.apply(self._init_weights)
+        # self.blocks = nn.Sequential(
+        #    Block(n_embd, n_head=4),
+        #    Block(n_embd, n_head=4),
+        #    Block(n_embd, n_head=4),
+        #    nn.LayerNorm(n_embd),
+        #)
+        #self.lm_head = nn.Linear(n_embd, vocab_size)
 
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        #self.blocks = nn.Sequential(*[Block(n_embd, n_head=n_head) for _ in range(n_layer)])
+        #self.ln_f = nn.LayerNorm(n_embd) # final layer norm
+        #self.lm_head = nn.Linear(n_embd, vocab_size)
+
+        #self.sa_heads = MultiHeadAttention(4, n_embd//4) # Each head is smaller - total adds up to the full embed_dzie
+        #self.ffwd = FeedFoward(n_embd)
+        #self.lm_head = nn.Linear(n_embd, vocab_size)
 
     def forward(self, idx, targets=None):
+
+        # Decide idx shape
         B, T = idx.shape
 
         # idx and targets are both (B,T) tensor of integers
         tok_emb = self.token_embedding_table(idx) # (B,T,C)
+        # KK: This is the positional encoding - integers from 0 to T-1 get mapped to a vector of size n_embd
         pos_emb = self.position_embedding_table(torch.arange(T, device=device)) # (T,C)
-        x = tok_emb + pos_emb # (B,T,C)
-        x = self.blocks(x) # (B,T,C)
-        x = self.ln_f(x) # (B,T,C)
+        x = tok_emb + pos_emb # (B,T,C) # KK: Add the two embeddings together - broadcasted across B
+        x = self.sa_heads(x) # (B,T,C) - apply one head of self attention
+        x = self.ffwd(x) # (B,T,C) - apply feed forward
         logits = self.lm_head(x) # (B,T,vocab_size)
 
         if targets is None:
@@ -183,7 +216,7 @@ class GPTLanguageModel(nn.Module):
         # idx is (B, T) array of indices in the current context
         for _ in range(max_new_tokens):
             # crop idx to the last block_size tokens
-            idx_cond = idx[:, -block_size:]
+            idx_cond = idx[:, -block_size]
             # get the predictions
             logits, loss = self(idx_cond)
             # focus only on the last time step
@@ -196,10 +229,8 @@ class GPTLanguageModel(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1) # (B, T+1)
         return idx
 
-model = GPTLanguageModel()
+model = BigramLanguageModel()
 m = model.to(device)
-# print the number of parameters in the model
-print(sum(p.numel() for p in m.parameters())/1e6, 'M parameters')
 
 # create a PyTorch optimizer
 optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
@@ -207,7 +238,7 @@ optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 for iter in range(max_iters):
 
     # every once in a while evaluate the loss on train and val sets
-    if iter % eval_interval == 0 or iter == max_iters - 1:
+    if iter % eval_interval == 0:
         losses = estimate_loss()
         print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
 
@@ -223,4 +254,3 @@ for iter in range(max_iters):
 # generate from the model
 context = torch.zeros((1, 1), dtype=torch.long, device=device)
 print(decode(m.generate(context, max_new_tokens=500)[0].tolist()))
-#open('more.txt', 'w').write(decode(m.generate(context, max_new_tokens=10000)[0].tolist()))

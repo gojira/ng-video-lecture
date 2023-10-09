@@ -43,9 +43,19 @@ def get_batch(split):
     x, y = x.to(device), y.to(device)
     return x, y
 
+# KK: GOod practice to call no grad because PyTorch will not need to keep track of the computation graph & gradients
+# This will save memory - no backpropagation
 @torch.no_grad()
 def estimate_loss():
+    """
+    ### Keiji comments
+    Average out the loss over a few batches
+    Get it for both splits - train & val
+    """
     out = {}
+    # KK: set model to eval mode
+    # Right now in this bigram model with only an embedding layer, this doesn't matter
+    # But in the GPT model, this will matter because of the dropout layers
     model.eval()
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
@@ -54,6 +64,7 @@ def estimate_loss():
             logits, loss = model(X, Y)
             losses[k] = loss.item()
         out[split] = losses.mean()
+    # KK: set model back to train mode
     model.train()
     return out
 
